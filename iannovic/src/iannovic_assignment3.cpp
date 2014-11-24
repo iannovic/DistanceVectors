@@ -13,7 +13,7 @@
  * This program is distributed in the hope that it will be useful, but
  * WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details at
+ * General Publicj License for more details at
  * http://www.gnu.org/copyleft/gpl.html
  *
  * @section DESCRIPTION
@@ -37,6 +37,7 @@
 #include <sstream>
 #include <errno.h>
 #include <netdb.h>
+#include <fstream>
 #include "../include/global.h"
 
 #include "../include/global.h"
@@ -52,20 +53,36 @@ using namespace std;
  * @return 0 EXIT_SUCCESS
  */
 
+/* FORMAT OF ONE DATAGRAM ENTITY */
+struct entry {
+	uint32_t server_address;
+	uint16_t server_port;
+	uint16_t buffer;
+	uint16_t server_id;
+	uint16_t cost;			//cost to reach the specified server
+} entry;
+
+/* META STRUCTURE OF DATAGRAM */
+struct header {
+	uint16_t fields_count;			//size of the entry array;
+	uint16_t server_port;			//port of sender
+	uint32_t server_address;		//address of sender
+	struct entry entries[5];		//there will be at most five entries in the array since only five servers
+};
+
+/* DATAGRAM IS A MEDIUM OF THIS STRUCTURE*/
+struct forwarding_table {
+	uint16_t intervals_since_update;	//intervals since last received update
+	uint16_t server_id;					//id of the server with this table
+	uint16_t number_of_servers;			//read this value in from the text file
+	uint16_t number_of_neighbors;		//read this value in from the text file
+	struct entry entries[5];			//list of entries in the file
+};
+
 int initListen();
+int readTopologyFile(char * filepath, struct forwarding_table *ftable);
+struct forwarding_table* initForwardingTable();					//DEFINE THIS
 
-/* INPUT PARAMETERS */
-
-int number_of_servers;		//read this value in from the text file
-int number_of_neighbors;	//read this value in from the text file
-int timeout	;				//read from arg associated with -i
-
-int port_number;			//read this value in from the text file
-
-
-/* ENDOF INPUT PARAMETERS */
-
-int listening_fd;			// populated by initListen();
 
 int main(int argc, char **argv)
 {
@@ -78,10 +95,16 @@ int main(int argc, char **argv)
         fclose(fopen(DUMPFILE, "wb"));
 
 	/*Start Here*/
-	
+
+    struct forwarding_table *ftable = initForwardingTable();
+    int timeout	;				//read from arg associated with -i
+    int pathIndex = 0;
+
+    int listeningFd;			// populated by initListen();
+
     /* DO VALIDATION OF CONSOLE INPUT AND MOVE ARGUMENTS TO VARIABLES APPROPRIATELY */
     cout << "beginning validation of console args... " << endl;
-	if (argc != 4)
+	if (argc != 5)
 	{
 			cout << argc << " is an illegal # of params" << endl;
 			cout << "there must be 4 args" << endl;
@@ -91,11 +114,15 @@ int main(int argc, char **argv)
 	if (strcmp(argv[1],"-i") == 0
 			&& strcmp(argv[3],"-t") == 0)
 	{
+		timeout = atoi(argv[2]);
+		pathIndex = 4;
 			/* argv[2] is interval and argv[4] is topology filepath */
 	}
 	else if (strcmp(argv[1],"-t") == 0
 				&& strcmp(argv[3],"-i") == 0)
 	{
+		timeout = atoi(argv[4]);
+		pathIndex = 2;
 			/* argv[4] is interval and argv[2] is topology filepath */
 	}
 	else
@@ -107,10 +134,19 @@ int main(int argc, char **argv)
 
 
 	/* READ TOPOLOGY FILE AND POPULATE PARAMETER VARIABLES*/
+	cout << "reading topology file" << endl;
+	if (-1 == readTopologyFile(argv[pathIndex],ftable))
+	{
+		cout << "failed to read topology file!" << endl;
+		return -1;
+	}
+
+	cout << "successfully read the topology file" << endl;
+	return 0;
 
 	/* INITIALIZE UDP LISTENING SOCKET WITH PARAMETER VARIABLES ACQUIRED FROM TOPOLOGY TEXT FILE*/
-	listening_fd = initListen();
-	if (listening_fd == -1)
+	listeningFd = initListen();
+	if (listeningFd == -1)
 	{
 		cout << "failed to open listening socket!" << endl;
 		return -1;
@@ -128,7 +164,7 @@ int main(int argc, char **argv)
 	 */
 
 	fd_set rfds;
-	FD_SET(listening_fd,&rfds);
+	FD_SET(listeningFd,&rfds);
 	FD_SET(0,&rfds);
 
 	if (select(1024,&rfds,NULL,NULL,NULL) == -1)
@@ -136,7 +172,7 @@ int main(int argc, char **argv)
 		cout << "failed to select: " << strerror(errno) << endl;
 		return -1;
 	}
-	if (FD_ISSET(listening_fd,&rfds))
+	if (FD_ISSET(listeningFd,&rfds))
 	{
 		cout << "received a datagram" << endl;
 		/*	RECEIVED DATAGRAM.	*/
@@ -173,6 +209,121 @@ int main(int argc, char **argv)
 	return 0;
 }
 
+int readTopologyFile(char * filepath, struct forwarding_table *ftable)
+{
+	/*
+	 * Topology file:
+	 *
+	 * 0				server count
+	 * 1				server neighbors
+	 * 2 thru n			server id and corresponding ip and port
+	 * n + 1 thru m 	my server id, neighbor server id, cost
+	 *
+	 * create forwarding table structure and populate it for this process
+	 *
+	 */
+
+	/* READ IN THE TOPOLOGY FILE*/
+
+	ifstream stream;
+	stream.open(filepath,ios::in);
+	int buffSize = 256;				//size, duh.
+
+	char buff[buffSize];		//char buffer to save token values;
+	memset(&buff,buffSize,0);
+	char c;							//last read char from the file
+	int buffIndex = 0;					//furthest index of a relevant char in the buffer
+	int tokenIndex = 0;				//number of tokens read on the current line number
+	int lineNumber = 0;				//how many lines have been read from the file
+	int entryIndex = 0;				//index into the entry structure to determine which to populate
+
+	int currentNeighborId = 0;		//reference to the last updated neighbor to update the cost
+
+	cout << "starting to read" << endl;
+	while (!stream.eof())
+	{
+		stream.get(c);
+		cout << c << endl;
+		if (c == ' ' || c == '\n')
+		{
+			//cout << "buffer contains " << buff << endl;
+			if (lineNumber == 0)		//this line corresponds to the number of servers in the network
+			{
+				ftable->number_of_servers = atoi(buff);
+				cout << "number of servers is " << ftable->number_of_servers << endl;
+				buffIndex = 0;
+			}
+			else if (lineNumber == 1)	//this line corresponds to the number of neighbors of this process
+			{
+				ftable->number_of_neighbors = atoi(buff);
+				cout << "number of neighbors is " << ftable->number_of_servers << endl;
+			}
+			else if (lineNumber <= 1 + ftable->number_of_servers)	//populate forwarding table with values
+			{
+				buff[buffIndex] = 0;
+				switch (tokenIndex)
+				{
+					case 0:
+							ftable->entries[entryIndex].server_id = atoi(buff);				//server-id in buffer
+							break;
+					case 1:
+							ftable->entries[entryIndex].server_address = atoi(buff);		//ip address in buffer
+							break;
+					case 2:
+							ftable->entries[entryIndex].server_port = atoi(buff);			//port in buffer
+							cout << ftable->entries[entryIndex].server_id << " "
+									<< ftable->entries[entryIndex].server_address << " "
+									<< ftable->entries[entryIndex].server_port << " " << endl;
+							entryIndex++;							//increment entryIndex because we populated each variable other than costs of this entry
+							break;
+				}
+			}
+			else if (lineNumber <= 1 + ftable->number_of_neighbors)
+			{
+				switch (tokenIndex)
+				{
+					case 0:	ftable->server_id = atoi(buff);				//server-id in buffer
+						break;
+					case 1:	currentNeighborId = atoi(buff);				//neighbor-id in buffer (used in case 2 of this switch)
+						break;
+					case 2: 											//cost in buffer
+							for (int i = 0; i < 5; i++)
+							{
+								if (ftable->entries[i].server_id == currentNeighborId)
+								{
+									ftable->entries[i].cost = atoi(buff);
+								}
+							}
+						break;
+				}
+			}
+
+			/* SEPERATE IF BLOCK ON PURPOSE. DIFFERENT INDEX UPDATES BASED ON WHETHER THE LINE IS NEW OR IT IS JUST A SPACE*/
+			if (c == '\n')
+			{
+				tokenIndex = 0;
+				lineNumber++;
+			}
+			else
+			{
+				tokenIndex++;
+			}
+			buffIndex = 0;
+			memset(&buff,buffSize,0);
+		}
+		else
+		{
+			/* MOVE CHAR INTO BUFFER AT INDEX */
+			buff[buffIndex] = c;
+			buffIndex++;
+		}
+
+	}
+
+	cout << "reading top file complete!" << endl;
+	return 0;
+}
+
 int initListen()
 {
 	struct addrinfo hints, *response;
@@ -188,11 +339,14 @@ int initListen()
 	/*
 		get the address info
 	*/
-	if (getaddrinfo(NULL,port_number,&hints,&response) != 0)
+
+	/*UNCOMMENT THIS
+	if (getaddrinfo(NULL,port_number_c,&hints,&response) != 0)
 	{
 		cout << "failed to get addr info: " << strerror(errno) << endl;
 		return -1;
 	}
+	*/
 	fd = socket(AF_INET,SOCK_DGRAM,0);
 	if (fd == -1)
 	{
@@ -205,4 +359,16 @@ int initListen()
 		return -1;
 	}
 	return fd;
+}
+
+struct forwarding_table* initForwardingTable()
+{
+	struct forwarding_table *ret = new forwarding_table;
+
+	ret->intervals_since_update = 0;
+	ret->number_of_neighbors = 0;
+	ret->number_of_servers = 0;
+	ret->server_id = 0;
+
+	return ret;
 }
