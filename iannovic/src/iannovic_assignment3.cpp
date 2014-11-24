@@ -60,7 +60,7 @@ struct entry {
 	uint16_t buffer;
 	uint16_t server_id;
 	uint16_t cost;			//cost to reach the specified server
-} entry;
+};
 
 /* META STRUCTURE OF DATAGRAM */
 struct header {
@@ -70,13 +70,22 @@ struct header {
 	struct entry entries[5];		//there will be at most five entries in the array since only five servers
 };
 
+/* SIMILAR TO DATAGRAM ENTRY BUT FOR FORWARDING TABLE */
+struct f_entry {
+	uint16_t server_port;
+	uint16_t buffer;
+	uint16_t server_id;
+	uint16_t cost;			//cost to reach the specified server
+	struct sockaddr_in sa;				//socket address structure to store the address
+};
+
 /* DATAGRAM IS A MEDIUM OF THIS STRUCTURE*/
 struct forwarding_table {
 	uint16_t intervals_since_update;	//intervals since last received update
 	uint16_t server_id;					//id of the server with this table
 	uint16_t number_of_servers;			//read this value in from the text file
 	uint16_t number_of_neighbors;		//read this value in from the text file
-	struct entry entries[5];			//list of entries in the file
+	struct f_entry entries[5];			//list of entries in the file
 };
 
 int initListen();
@@ -243,10 +252,10 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 	while (!stream.eof())
 	{
 		stream.get(c);
-		cout << c << endl;
 		if (c == ' ' || c == '\n')
 		{
-			//cout << "buffer contains " << buff << endl;
+			buff[buffIndex] = 0;
+			cout << "buffer contains " << buff << endl;
 			if (lineNumber == 0)		//this line corresponds to the number of servers in the network
 			{
 				ftable->number_of_servers = atoi(buff);
@@ -260,25 +269,31 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 			}
 			else if (lineNumber <= 1 + ftable->number_of_servers)	//populate forwarding table with values
 			{
-				buff[buffIndex] = 0;
 				switch (tokenIndex)
 				{
 					case 0:
 							ftable->entries[entryIndex].server_id = atoi(buff);				//server-id in buffer
 							break;
 					case 1:
-							ftable->entries[entryIndex].server_address = atoi(buff);		//ip address in buffer
+
+							if (1 != inet_pton(AF_INET,buff,&(ftable->entries[entryIndex].sa.sin_addr)))
+							{
+								cout << "failed to convert the buffer into an address structure" << endl;
+							}
+							/* REFERENCE THIS FOR PRINTING IP ADDRESS
+							ip = inet_ntoa(ftable->entries[entryIndex].sa.sin_addr);
+							cout << ip << endl;
+							*/
+
 							break;
 					case 2:
 							ftable->entries[entryIndex].server_port = atoi(buff);			//port in buffer
-							cout << ftable->entries[entryIndex].server_id << " "
-									<< ftable->entries[entryIndex].server_address << " "
-									<< ftable->entries[entryIndex].server_port << " " << endl;
+							cout << ftable->entries[entryIndex].server_id << " " <<  ftable->entries[entryIndex].server_port << " " << endl;
 							entryIndex++;							//increment entryIndex because we populated each variable other than costs of this entry
 							break;
 				}
 			}
-			else if (lineNumber <= 1 + ftable->number_of_neighbors)
+			else if (lineNumber <= 1 + ftable->number_of_neighbors + ftable->number_of_servers)
 			{
 				switch (tokenIndex)
 				{
@@ -292,6 +307,7 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 								if (ftable->entries[i].server_id == currentNeighborId)
 								{
 									ftable->entries[i].cost = atoi(buff);
+									//cout << "server id " << currentNeighborId << "has cost " << 	ftable->entries[i].cost << endl;
 								}
 							}
 						break;
