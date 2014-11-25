@@ -22,8 +22,8 @@
  */
 #include <iostream>
 #include <stdio.h>
-#include <iostream>
 #include <cstdlib>
+#include <iostream>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -38,8 +38,6 @@
 #include <errno.h>
 #include <netdb.h>
 #include <fstream>
-#include "../include/global.h"
-
 #include "../include/global.h"
 #include "../include/logger.h"
 
@@ -70,12 +68,13 @@ struct header {
 	struct entry entries[5];		//there will be at most five entries in the array since only five servers
 };
 
-/* SIMILAR TO DATAGRAM ENTRY BUT FOR FORWARDING TABLE */
+/* SIMILAR TO DATAGRAM ENTRY BUT FOR FORWARDING TABLE ONLY CHANGES THE ADDRESS STRUCTURE */
 struct f_entry {
 	uint16_t server_port;
 	uint16_t buffer;
 	uint16_t server_id;
 	uint16_t cost;			//cost to reach the specified server
+	uint16_t next_hop_id;				//id of the next hop server in the path to reach the final destination of server_id
 	struct sockaddr_in sa;				//socket address structure to store the address
 };
 
@@ -88,9 +87,20 @@ struct forwarding_table {
 	struct f_entry entries[5];			//list of entries in the file
 };
 
-int initListen();
+int initListen(char * portNumber);
 int readTopologyFile(char * filepath, struct forwarding_table *ftable);
 struct forwarding_table* initForwardingTable();					//DEFINE THIS
+void printForwardingTable(struct forwarding_table *ftable);
+int createDatagram(struct forwarding_table *ftable, struct header * ret,char * buffer);	//forwarding table to dgram
+int createTable(struct header * dgram, struct forwarding_table **ftable);				//dgram to ftable
+int serializeDatagram(struct header * dgram, char * buf);								//dgram to byte order buffer
+int deserializeDatagram(struct header * dgram, char * buf);								// byte order buffer to dgram
+int updateNeighbors (struct forwarding_table * ftable);
+int sendTable(int serverId, struct forwarding_table * ftable);
+int insertIntoRouting(struct forwarding_table *ftable, struct forwarding_table **rtable);
+int updateForwardingTable(struct forwarding_table **rtable);
+int updateTableEntry(struct forwarding_table *base,struct forwarding_table *comparee,int id);
+
 
 
 int main(int argc, char **argv)
@@ -104,12 +114,8 @@ int main(int argc, char **argv)
         fclose(fopen(DUMPFILE, "wb"));
 
 	/*Start Here*/
-
-    struct forwarding_table *ftable = initForwardingTable();
     int timeout	;				//read from arg associated with -i
     int pathIndex = 0;
-
-    int listeningFd;			// populated by initListen();
 
     /* DO VALIDATION OF CONSOLE INPUT AND MOVE ARGUMENTS TO VARIABLES APPROPRIATELY */
     cout << "beginning validation of console args... " << endl;
@@ -142,6 +148,16 @@ int main(int argc, char **argv)
 	cout << "ending validation of console args... " << endl;
 
 
+
+	/* CREATE ROUTING TABLE TO STORE ALL FORWARDING TABLES FROM ALL SERVERS*/
+	struct forwarding_table *ftable = initForwardingTable();
+	struct forwarding_table *rtable[5];
+	rtable[0] = ftable;
+	for (int i = 1; i < 5; i ++)
+	{
+		rtable[i] = NULL;
+	}
+
 	/* READ TOPOLOGY FILE AND POPULATE PARAMETER VARIABLES*/
 	cout << "reading topology file" << endl;
 	if (-1 == readTopologyFile(argv[pathIndex],ftable))
@@ -151,10 +167,22 @@ int main(int argc, char **argv)
 	}
 
 	cout << "successfully read the topology file" << endl;
-	return 0;
 
+	/* DETERMINE LOCAL PORT NUMBER FROM TOPOLOGY RESULTS	*/
+    char portNumber[5];
+    for (int i = 0; i < 5; i ++)
+    {
+    	if (ftable->entries[i].server_id == ftable->server_id)
+    	{
+    		sprintf(portNumber,"%d",ftable->entries[i].server_port);
+    		cout << "process port number is " << portNumber << endl;
+    	}
+    }
+
+    cout << "your initial forwarding table for this process is " << endl;
+    printForwardingTable(rtable[0]);
 	/* INITIALIZE UDP LISTENING SOCKET WITH PARAMETER VARIABLES ACQUIRED FROM TOPOLOGY TEXT FILE*/
-	listeningFd = initListen();
+	int listeningFd = initListen(portNumber);
 	if (listeningFd == -1)
 	{
 		cout << "failed to open listening socket!" << endl;
@@ -172,49 +200,82 @@ int main(int argc, char **argv)
 	 * 		-->	Increment timeSinceUpdate variable for each neighbor.
 	 */
 
-	fd_set rfds;
-	FD_SET(listeningFd,&rfds);
-	FD_SET(0,&rfds);
+	while (true)
+	{
+		struct timeval timer;
+		timer.tv_sec = timeout;
+		timer.tv_usec = 0;
+		fd_set rfds;
+		FD_ZERO(&rfds);
+		FD_SET(listeningFd,&rfds);
+		FD_SET(0,&rfds);
 
-	if (select(1024,&rfds,NULL,NULL,NULL) == -1)
-	{
-		cout << "failed to select: " << strerror(errno) << endl;
-		return -1;
-	}
-	if (FD_ISSET(listeningFd,&rfds))
-	{
-		cout << "received a datagram" << endl;
-		/*	RECEIVED DATAGRAM.	*/
-	}
-	if (FD_ISSET(0,&rfds))
-	{
-		cout << "received console command" << endl;
-		/* RECEIVED CONSOLE COMMAND */
-
-		std::string line;
-		std::getline(std::cin,line);
-		int maxTokensRead = 32;
-		string arg[maxTokensRead];
-		int argc = 0;
-		stringstream ssin(line);
-		while (ssin.good())
+		int ret = select(1024,&rfds,NULL,NULL,&timer);
+		if (ret == -1)
 		{
-			ssin >> arg[argc];
-			//cout << arg[argc] << endl;
-			argc++;
-			if (argc >= maxTokensRead)
+			cout << "failed to select: " << strerror(errno) << endl;
+			return -1;
+		}
+		else if (ret == 0)
+		{
+			cout << "send updates to everyone!" << endl;
+			if (-1 == updateNeighbors(rtable[0]))
 			{
-				cout << "cannot have that many arguments" << endl;
-				break;
+				cout << "failed to update neighbors" << endl;
+				return -1;
 			}
 		}
-
-		if (arg[0].compare("help") == 0)
+		if (FD_ISSET(listeningFd,&rfds))
 		{
-			cout << "do you need help?" << endl;
+			/*	RECEIVED DATAGRAM.	*/
+			cout << "received a datagram" << endl;
+			char buffer[sizeof(header)];
+			int numBytes = recv(listeningFd,buffer,sizeof(header),0);
+			if (numBytes == -1)
+			{
+				cout << "failed to recv dgram " << strerror(errno) << endl;
+			}
+			struct header dgram;
+			deserializeDatagram(&dgram,buffer);
+
+			struct forwarding_table *ft;
+			if (-1 == createTable(&dgram,&ft))
+			{
+				cout << "failed to create table from datagram" << endl;
+			}
+			printForwardingTable(ft);
+			insertIntoRouting(ft,rtable);
+			updateForwardingTable(rtable);
+		}
+		if (FD_ISSET(0,&rfds))
+		{
+			cout << "received console command" << endl;
+			/* RECEIVED CONSOLE COMMAND */
+
+			std::string line;
+			std::getline(std::cin,line);
+			int maxTokensRead = 32;
+			string arg[maxTokensRead];
+			int argc = 0;
+			stringstream ssin(line);
+			while (ssin.good())
+			{
+				ssin >> arg[argc];
+				//cout << arg[argc] << endl;
+				argc++;
+				if (argc >= maxTokensRead)
+				{
+					cout << "cannot have that many arguments" << endl;
+					break;
+				}
+			}
+
+			if (arg[0].compare("help") == 0)
+			{
+				cout << "do you need help?" << endl;
+			}
 		}
 	}
-
 	return 0;
 }
 
@@ -233,7 +294,6 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 	 */
 
 	/* READ IN THE TOPOLOGY FILE*/
-
 	ifstream stream;
 	stream.open(filepath,ios::in);
 	int buffSize = 256;				//size, duh.
@@ -241,7 +301,7 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 	char buff[buffSize];		//char buffer to save token values;
 	memset(&buff,buffSize,0);
 	char c;							//last read char from the file
-	int buffIndex = 0;					//furthest index of a relevant char in the buffer
+	int buffIndex = 0;				//furthest index of a relevant char in the buffer
 	int tokenIndex = 0;				//number of tokens read on the current line number
 	int lineNumber = 0;				//how many lines have been read from the file
 	int entryIndex = 0;				//index into the entry structure to determine which to populate
@@ -255,7 +315,7 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 		if (c == ' ' || c == '\n')
 		{
 			buff[buffIndex] = 0;
-			cout << "buffer contains " << buff << endl;
+			//cout << "buffer contains " << buff << endl;
 			if (lineNumber == 0)		//this line corresponds to the number of servers in the network
 			{
 				ftable->number_of_servers = atoi(buff);
@@ -335,12 +395,21 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 		}
 
 	}
+	/* BEFORE WE RETURN, WE SET THE VALUE OF ENTRY CONTAINING THE PROCESS' INFO TO HAVE A SELF LINK COST OF 0*/
+	for(int i = 0; i < 5; i++)
+	{
+		if (ftable->server_id == ftable->entries[i].server_id)
+		{
+			ftable->entries[i].cost = 0;
+		}
+		ftable->entries[i].next_hop_id = ftable->server_id;
+	}
 
 	cout << "reading top file complete!" << endl;
 	return 0;
 }
 
-int initListen()
+int initListen(char * portNumber)
 {
 	struct addrinfo hints, *response;
 
@@ -356,13 +425,11 @@ int initListen()
 		get the address info
 	*/
 
-	/*UNCOMMENT THIS
-	if (getaddrinfo(NULL,port_number_c,&hints,&response) != 0)
+	if (getaddrinfo(NULL,portNumber,&hints,&response) != 0)
 	{
 		cout << "failed to get addr info: " << strerror(errno) << endl;
 		return -1;
 	}
-	*/
 	fd = socket(AF_INET,SOCK_DGRAM,0);
 	if (fd == -1)
 	{
@@ -385,6 +452,315 @@ struct forwarding_table* initForwardingTable()
 	ret->number_of_neighbors = 0;
 	ret->number_of_servers = 0;
 	ret->server_id = 0;
-
+	for (int i = 0; i < 5; i ++)
+	{
+		ret->entries[i].buffer = 0;
+		ret->entries[i].server_id = 0;
+		ret->entries[i].server_port = 0;
+		ret->entries[i].cost = UINT_LEAST16_MAX;		//initialize this to be the max unsigned 16bit int value should be 65k
+	}
 	return ret;
+}
+
+void printForwardingTable(struct forwarding_table *ftable)
+{
+	cout << "servers: " << ftable->number_of_servers << endl;
+	cout << "neighbors: " << ftable->number_of_neighbors << endl;
+	cout << "server id: " << ftable->server_id << endl;
+	for (int i = 0; i < 5; i++)
+	{
+		cout << "id: " << ftable->entries[i].server_id << " cost: " << ftable->entries[i].cost
+				<< " addr: " << inet_ntoa(ftable->entries[i].sa.sin_addr) << " port: " << ftable->entries[i].server_port << endl;
+	}
+}
+
+/* this function returns the non serialized and serialized byte order version of the datagram */
+int createDatagram(struct forwarding_table *ftable, struct header * ret, char * buffer)
+{
+	ret->fields_count = ftable->number_of_servers;
+
+	/* DETERMINE PORT AND ADDR OF SENDER */
+	for (int i = 0; i < 5; i ++)
+	{
+		if (ftable->server_id == ftable->entries[i].server_id)
+		{
+			ret->server_port = ftable->entries[i].server_port;
+			ret->server_address = ftable->entries[i].sa.sin_addr.s_addr;
+		}
+	}
+	/* POPULATE EACH ENTRY OF THE DGRAM*/
+	for (int i = 0; i < 5; i ++)
+	{
+		ret->entries[i].buffer = 0;
+		ret->entries[i].cost = ftable->entries[i].cost;
+		ret->entries[i].server_address = ftable->entries[i].sa.sin_addr.s_addr;
+		ret->entries[i].server_id = ftable->entries[i].server_id;
+		ret->entries[i].server_port = ftable->entries[i].server_port;
+	}
+
+	return serializeDatagram(ret,buffer);			//number of relevant bytes in the buffer
+}
+
+int serializeDatagram(struct header * dgram, char * buf)
+{
+
+	int bufferIndex = 0;
+	uint16_t shortBuf;
+	uint32_t longBuf;
+
+	shortBuf = htons(dgram->fields_count);
+	memcpy(buf + bufferIndex,&shortBuf,2);
+	bufferIndex += 2;
+
+	shortBuf = htons(dgram->server_port);
+	memcpy(buf + bufferIndex,&shortBuf,2);
+	bufferIndex += 2;
+
+	longBuf =  htonl(dgram->server_address);
+	memcpy(buf + bufferIndex,&longBuf,4);
+	bufferIndex += 4;
+
+	for (int i = 0; i < 5; i ++)
+	{
+		shortBuf = htons(dgram->entries[i].server_port);
+		memcpy(buf + bufferIndex,&shortBuf,2);
+		bufferIndex += 2;
+
+		shortBuf = htons(dgram->entries[i].buffer);
+		memcpy(buf + bufferIndex,&shortBuf,2);
+		bufferIndex += 2;
+
+		shortBuf = htons(dgram->entries[i].server_id);
+		memcpy(buf + bufferIndex,&shortBuf,2);
+		bufferIndex += 2;
+
+		shortBuf = htons(dgram->entries[i].cost);
+		memcpy(buf + bufferIndex,&shortBuf,2);
+		bufferIndex += 2;
+
+		longBuf = htonl(dgram->entries[i].server_address);
+		memcpy(buf + bufferIndex,&longBuf,4);
+		bufferIndex += 4;
+
+	}							// = 12 chars * 5 = 60 + 8 = 68 bytes
+	return bufferIndex;			//number of relevant bytes in the buffer
+}
+
+int deserializeDatagram(struct header * dgram, char * buf)
+{
+
+	int bufferIndex = 0;
+	uint16_t shortBuf;
+	uint32_t longBuf;
+
+	uint16_t shortResultBuf;
+	uint32_t longResultBuf;
+
+	memcpy(&shortBuf,buf + bufferIndex,2);
+	shortResultBuf = ntohs(shortBuf);
+	dgram->fields_count = shortResultBuf;
+	bufferIndex += 2;
+
+	memcpy(&shortBuf,buf + bufferIndex,2);
+	shortResultBuf = ntohs(shortBuf);
+	dgram->server_port = shortResultBuf;
+	bufferIndex += 2;
+
+	memcpy(&longBuf,buf + bufferIndex,4);
+	longResultBuf = ntohl(longBuf);
+	dgram->server_address = longResultBuf;
+	bufferIndex += 4;
+
+	for (int i = 0; i < 5; i ++)
+	{
+		memcpy(&shortBuf,buf + bufferIndex,2);
+		shortResultBuf = ntohs(shortBuf);
+		dgram->entries[i].server_port = shortResultBuf;
+		bufferIndex += 2;
+
+		memcpy(&shortBuf,buf + bufferIndex,2);
+		shortResultBuf = ntohs(shortBuf);
+		dgram->entries[i].buffer = shortResultBuf;
+		bufferIndex += 2;
+
+		memcpy(&shortBuf,buf + bufferIndex,2);
+		shortResultBuf = ntohs(shortBuf);
+		dgram->entries[i].server_id = shortResultBuf;
+		bufferIndex += 2;
+
+		memcpy(&shortBuf,buf + bufferIndex,2);
+		shortResultBuf = ntohs(shortBuf);
+		dgram->entries[i].cost = shortResultBuf;
+		bufferIndex += 2;
+
+		memcpy(&longBuf,buf + bufferIndex,4);
+		longResultBuf = ntohl(longBuf);
+		dgram->entries[i].server_address = longResultBuf;
+		bufferIndex += 4;
+
+	}							// = 12 chars * 5 = 60 + 8 = 68 bytes
+	return bufferIndex;			//number of relevant bytes in the buffer
+}
+
+int createTable(struct header * dgram, struct forwarding_table ** ftable)
+{
+	struct forwarding_table *ret;
+	ret = initForwardingTable();
+
+	ret->number_of_servers = dgram->fields_count;
+
+	for (int i = 0; i < 5; i ++)
+	{
+		if (dgram->entries[i].cost == 0)
+		{
+			ret->server_id = dgram->entries[i].server_id;
+		}
+		if (dgram->entries[i].cost != 0 && dgram->entries[i].cost != UINT_LEAST16_MAX)
+		{
+			ret->number_of_neighbors++;
+		}
+		ret->entries[i].buffer = dgram->entries[i].buffer;
+		ret->entries[i].cost = dgram->entries[i].cost;
+		ret->entries[i].server_id = dgram->entries[i].server_id;
+		ret->entries[i].server_port = dgram->entries[i].server_port;
+		ret->entries[i].sa.sin_addr.s_addr = dgram->entries[i].server_address;
+	}
+	*ftable = ret;
+	return 0;
+}
+
+int updateNeighbors(struct forwarding_table *ftable)
+{
+	for (int i = 0; i < 5; i++)
+	{
+		if (ftable->entries[i].cost != 0 && ftable->entries[i].cost != UINT_LEAST16_MAX)
+		{
+			if (-1 == sendTable(ftable->entries[i].server_id, ftable))
+			{
+				cout << "failed to send forwarding table to id " << ftable->entries[i].server_id << endl;
+				return -1;
+			}
+		}
+	}
+	return 0;
+}
+
+int sendTable(int serverId, struct forwarding_table * ftable)
+{
+	struct addrinfo hints, *response;
+	int fd = 0;
+	memset(&hints,0, sizeof hints);
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_flags = AI_PASSIVE;
+	hints.ai_protocol = IPPROTO_UDP;
+
+    char portNumber[5];
+    char ip[INET_ADDRSTRLEN];
+    for (int i = 0; i < 5; i ++)
+    {
+    	if (serverId == ftable->entries[i].server_id)
+    	{
+    		sprintf(portNumber,"%d",ftable->entries[i].server_port);
+    		inet_ntop(AF_INET,&(ftable->entries[i].sa.sin_addr.s_addr),ip,INET_ADDRSTRLEN);
+    	}
+    }
+    cout << "sending to ip: " << ip << endl;
+	/*
+		get the address info
+	*/
+
+	if (getaddrinfo(ip,portNumber,&hints,&response) != 0)
+	{
+		cout << "failed to get addr info: " << strerror(errno) << endl;
+		return -1;
+	}
+	fd = socket(AF_INET,SOCK_DGRAM,0);
+	if (fd == -1)
+	{
+		cout << "failed to open a socket: " << strerror(errno) << endl;
+		return -1;
+	}
+	struct header dgram;
+	char buf[128];
+	int numBytesInBuf = createDatagram(ftable,&dgram,buf);
+	if (-1 == numBytesInBuf)
+	{
+		cout << "failed to create datagram!" << endl;
+		return -1;
+	}
+
+	int bytes_sent = sendto(fd,buf,numBytesInBuf,0,response->ai_addr,response->ai_addrlen);
+	if (-1 == bytes_sent)
+	{
+		cout << "failed to send" << strerror(errno) <<endl;
+	}
+	return 0;
+}
+
+int insertIntoRouting(struct forwarding_table *ftable, struct forwarding_table **rtable)
+{
+	int i = 0;
+	while (rtable[i] != NULL && i < 5)
+	{
+		if (rtable[i]->server_id == ftable->server_id)
+		{
+			rtable[i] = ftable;			//replace the existing forwarding table with  the more up to date one
+			cout << "replacing existing ftable in rtable " << endl;
+			return 0;
+		}
+		i++;
+	}
+
+	if (i < 5)		//rtable is not full. insert into table at the first null pointer
+	{
+		rtable[i] = ftable;
+		cout << "adding new entry to rtable " << endl;
+	}
+	cout << "successfully updated routing table" << endl;
+	return 0;
+}
+int updateForwardingTable(struct forwarding_table **rtable)
+{
+	/*determining new costs of forwarding table*/
+	cout << "determing new costs of forwarding table " << endl;
+	for (int i = 1; i < 5; i ++)
+	{
+		if (-1 == updateTableEntry(rtable[0],rtable[i],rtable[0]->entries[i].server_id))
+		{
+			cout << "failed to update Table Entry" << endl;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+int updateTableEntry(struct forwarding_table *base,struct forwarding_table *comparee,int id)
+{
+	/* DETERMINE COST TO COMPAREE */
+	int costToComparee = UINT_LEAST16_MAX;
+	for (int i = 0; i < 5; i ++)
+	{
+		if (base->entries[i].server_id == comparee->server_id)
+		{
+			costToComparee = base->entries[i].cost;
+		}
+	}
+	for (int i = 0; i < 5; i++)
+	{
+		for (int j = 0; j < 5; j++)
+		{
+			if (base->entries[i].server_id == comparee->entries[j].server_id)
+			{
+				cout << "i is now " << i << endl;
+				if (comparee->entries[j].cost < base->entries[i].cost + costToComparee)
+				{
+					cout << "updated the cost of a link in a forwarding table for id " << comparee->server_id << endl;
+					base->entries[i].cost = comparee->entries[j].cost + costToComparee;
+					base->entries[i].next_hop_id = comparee->server_id;
+				}
+			}
+		}
+	}
+	return 0;
 }
