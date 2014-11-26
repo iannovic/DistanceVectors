@@ -56,11 +56,17 @@ using namespace std;
 /*****************************************************************
  * CONSTANTS *****************************************************
  *****************************************************************/
-static const time_t TIMEOUT;
+static time_t TIMEOUT;
 static const uint16_t UINT16_MX = 65535;
 static const uint16_t MAX_SERVERS = 5;
 
-/* FORMAT OF ONE DATAGRAM ENTITY */
+/* USE THESE FOR display() FUNCTION*/
+static const int PACKET_FLAG = 1;
+static const int CMD_FLAG = 2;
+
+/*
+ *  [PA3] Update Packet Start
+ */
 struct entry {
 	uint32_t server_address;
 	uint16_t server_port;
@@ -69,7 +75,6 @@ struct entry {
 	uint16_t cost;			//cost to reach the specified server
 };
 
-/* META STRUCTURE OF DATAGRAM */
 struct header {
 	uint16_t fields_count;			//size of the entry array;
 	uint16_t server_port;			//port of sender
@@ -77,28 +82,37 @@ struct header {
 	struct entry entries[MAX_SERVERS];		//there will be at most five entries in the array since only five servers
 };
 
-/* SIMILAR TO DATAGRAM ENTRY BUT FOR FORWARDING TABLE ONLY CHANGES THE ADDRESS STRUCTURE */
+/*
+ * [PA3] Update Packet End
+ */
+
+/*
+ * [PA3] Routing Table Start
+ */
 struct f_entry {
 	uint16_t server_port;
 	uint16_t buffer;
 	uint16_t server_id;
 	uint16_t cost;			//cost to reach the specified server
-	uint16_t next_hop_id;				//id of the next hop server in the path to reach the final destination of server_id
+	int next_hop_id;				//id of the next hop server in the path to reach the final destination of server_id
 	bool is_neighbor;
 	bool is_disabled;
 	struct sockaddr_in sa;				//socket address structure to store the address
 };
 
-/* DATAGRAM IS A MEDIUM OF THIS STRUCTURE*/
 struct forwarding_table {
 	uint16_t intervals_since_update;	//intervals since last received update
 	time_t last_packet_rcvd;			//time of the last packet received
 	uint16_t server_id;					//id of the server with this table
 	uint16_t number_of_servers;			//read this value in from the text file
 	uint16_t number_of_neighbors;		//read this value in from the text file
+	bool is_crashed;					//should be false at start, if true then do not send packets to anyone and disregard all packets
 	struct f_entry entries[MAX_SERVERS];			//list of entries in the file
 };
 
+/*
+ * [PA3] Routing Table End
+ */
 int initListen(char * portNumber);
 int readTopologyFile(char * filepath, struct forwarding_table *ftable);
 struct forwarding_table* initForwardingTable();					//DEFINE THIS
@@ -111,10 +125,13 @@ int updateNeighbors (struct forwarding_table * ftable,struct forwarding_table **
 int sendTable(int serverId, struct forwarding_table * ftable);
 int insertIntoRouting(struct forwarding_table *ftable, struct forwarding_table **rtable);
 int updateForwardingTable(struct forwarding_table * routing_table, struct forwarding_table **rtable);
-int updateTableEntry(struct forwarding_table *base,struct forwarding_table *comparee,int id);
+int updateTableEntry(struct forwarding_table *routing_table, struct forwarding_table *base,struct forwarding_table *comparee);
 int resetRoutingTableCosts(struct forwarding_table *routing_table);
 bool isDisabled(struct forwarding_table * routing_table, int serverId);
+
 int disable(struct forwarding_table *routing_table,struct forwarding_table **rtable, int server_id);
+int display(struct forwarding_table *routing_table,int flag);
+int update(int serverId, int cost, struct forwarding_table *rtable);
 
 int main(int argc, char **argv)
 {
@@ -131,14 +148,13 @@ int main(int argc, char **argv)
     int numPacketsReceivedSinceLastPackets = 0;
 
     /* DO VALIDATION OF CONSOLE INPUT AND MOVE ARGUMENTS TO VARIABLES APPROPRIATELY */
-    cout << "beginning validation of console args... " << endl;
+   // cout << "beginning validation of console args... " << endl;
 	if (argc != 5)
 	{
 			cout << argc << " is an illegal # of params" << endl;
 			cout << "there must be 4 args" << endl;
 			return -1;
 	}
-
 	if (strcmp(argv[1],"-i") == 0
 			&& strcmp(argv[3],"-t") == 0)
 	{
@@ -158,9 +174,8 @@ int main(int argc, char **argv)
 			cout << "invalid arguments." << endl;
 			return -1;
 	}
-	cout << "ending validation of console args... " << endl;
 
-
+	//cout << "ending validation of console args... " << endl;
 
 	/* CREATE ROUTING TABLE TO STORE ALL FORWARDING TABLES FROM ALL SERVERS*/
 	struct forwarding_table *ftable = initForwardingTable();
@@ -173,14 +188,14 @@ int main(int argc, char **argv)
 	}
 
 	/* READ TOPOLOGY FILE AND POPULATE PARAMETER VARIABLES*/
-	cout << "reading topology file" << endl;
+	//cout << "reading topology file" << endl;
 	if (-1 == readTopologyFile(argv[pathIndex],ftable))
 	{
 		cout << "failed to read topology file!" << endl;
 		return -1;
 	}
 
-	cout << "successfully read the topology file" << endl;
+	//cout << "successfully read the topology file" << endl;
 
 	/* DETERMINE LOCAL PORT NUMBER FROM TOPOLOGY RESULTS	*/
     char portNumber[5];
@@ -189,13 +204,12 @@ int main(int argc, char **argv)
     	if (ftable->entries[i].server_id == ftable->server_id)
     	{
     		sprintf(portNumber,"%d",ftable->entries[i].server_port);
-    		cout << "process port number is " << portNumber << endl;
     	}
     }
 
-    cout << "your initial forwarding table for this process is " << endl;
+    //cout << "your initial forwarding table for this process is " << endl;
     updateForwardingTable(routing_table,rtable);
-    printForwardingTable(routing_table);
+    //printForwardingTable(routing_table);
 	/* INITIALIZE UDP LISTENING SOCKET WITH PARAMETER VARIABLES ACQUIRED FROM TOPOLOGY TEXT FILE*/
 	int listeningFd = initListen(portNumber);
 	if (listeningFd == -1)
@@ -221,10 +235,10 @@ int main(int argc, char **argv)
 		timer.tv_sec = TIMEOUT;
 		if (lastTimeout != 0 && lastTimeout <= time(NULL) - TIMEOUT)
 		{
-			cout << "forcing a timeout" << endl;
+			//cout << "forcing a timeout" << endl;
 			timer.tv_sec = 0;
 		}
-		cout << "system time " << lastTimeout << endl;
+		//cout << "system time " << lastTimeout << endl;
 		timer.tv_usec = 0;
 		fd_set rfds;
 		FD_ZERO(&rfds);
@@ -240,19 +254,21 @@ int main(int argc, char **argv)
 		else if (ret == 0)
 		{
 			lastTimeout = time(NULL);
-			cout << "new timeout value is" << lastTimeout << endl;
-			cout << "Timeout, sending update" << endl;
-			if (-1 == updateNeighbors(routing_table,rtable))
+
+			//cout << "new timeout value is" << lastTimeout << endl;
+			//cout << "Timeout, sending update" << endl;
+			if (!routing_table->is_crashed)
 			{
-				cout << "failed to update neighbors" << endl;
-				return -1;
+				if (-1 == updateNeighbors(routing_table,rtable))
+				{
+					cout << "failed to update neighbors" << endl;
+					return -1;
+				}
 			}
 		}
 		if (FD_ISSET(listeningFd,&rfds))
 		{
 			/*	RECEIVED DATAGRAM.	*/
-			cout << "received a datagram" << endl;
-			numPacketsReceivedSinceLastPackets++;
 			char buffer[sizeof(header)];
 			int numBytes = recv(listeningFd,buffer,sizeof(header),0);
 			if (numBytes == -1)
@@ -269,15 +285,24 @@ int main(int argc, char **argv)
 				cout << "failed to create table from datagram" << endl;
 			}
 			ft->last_packet_rcvd = time(NULL);
-			//printForwardingTable(ft);
-			insertIntoRouting(ft,rtable);
-			updateForwardingTable(routing_table,rtable);
-
-			printForwardingTable(routing_table);
+			cse4589_print_and_log("RECEIVED A MESSAGE FROM SERVER %d\n",ft->server_id);
+			display(ft,PACKET_FLAG);
+			if (!isDisabled(routing_table,ft->server_id) && !routing_table->is_crashed)
+			{
+				if (-1 == insertIntoRouting(ft,rtable))
+				{
+					cout << "did not insert routing table"	<< endl;
+				}
+				else
+				{
+					numPacketsReceivedSinceLastPackets++;
+				}
+				updateForwardingTable(routing_table,rtable);
+			}
 		}
 		if (FD_ISSET(0,&rfds))
 		{
-			cout << "received console command" << endl;
+			//cout << "received console command" << endl;
 			/* RECEIVED CONSOLE COMMAND */
 
 			std::string line;
@@ -289,7 +314,6 @@ int main(int argc, char **argv)
 			while (ssin.good())
 			{
 				ssin >> arg[argc];
-				//cout << arg[argc] << endl;
 				argc++;
 				if (argc >= maxTokensRead)
 				{
@@ -300,55 +324,118 @@ int main(int argc, char **argv)
 
 			if (arg[0].compare("update") == 0)
 			{
-				cout << "update" << endl;
+				if (argc != 4)
+				{
+					cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"invalid arguments");
+				}
+				else
+				{
+					int sourceId = atoi(arg[1].c_str());
+					int cost = atoi(arg[3].c_str());
+					int destinationId = atoi(arg[2].c_str());
+
+					if (sourceId != routing_table->server_id)
+					{
+						cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"arg1 must be source id (self)");
+					}
+					else
+					{
+						if (-1 == update(destinationId,cost,rtable[0]))
+						{
+							cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed during the update()");
+						}
+						else
+						{
+							if (-1 == updateForwardingTable(routing_table,rtable))
+							{
+								cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed to run algorithm after update");
+							}
+							else
+							{
+								cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
+							}
+						}
+					}
+
+				}
 			}
 			else if (arg[0].compare("step") == 0)
 			{
-				if (-1 == updateNeighbors(routing_table,rtable))
+				if (-1 == updateForwardingTable(routing_table,rtable))
 				{
-					cout << "failed to update neighbors" << endl;
-					return -1;
+					cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed get shortest paths");
 				}
-				else cse4589_print_and_log("%s:SUCCESS",arg[0].c_str());
+				else if (-1 == updateNeighbors(routing_table,rtable))
+				{
+					cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed update neighbors");
+				}
+				else
+				{
+					cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
+				}
 			}
 			else if (arg[0].compare("packets") == 0)
 			{
-				cout << "received " << numPacketsReceivedSinceLastPackets << " packets" << endl;
+				cse4589_print_and_log("%d\n", numPacketsReceivedSinceLastPackets);
 				numPacketsReceivedSinceLastPackets = 0;
-				cse4589_print_and_log("%s:SUCCESS",arg[0].c_str());
+				cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
 			}
 			else if (arg[0].compare("display") == 0)
 			{
-				cout << "update" << endl;
+				if (-1 == updateForwardingTable(routing_table,rtable))
+				{
+					cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed to display because failed to update forwarding table first");
+				}
+				if (-1 == display(routing_table,CMD_FLAG))
+				{
+					cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed to display");
+				}
+				else
+				{
+					cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
+				}
 			}
 			else if (arg[0].compare("disable") == 0)
 			{
 				if (argc != 2)
 				{
-					cout << "error! not the correct amount of args" << endl;
+					cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"invalid arguments");
 				}
 				else
 				{
 					int serverId = atoi(arg[1].c_str());
 					if (-1 == disable(routing_table,rtable,serverId))
 					{
-						cout << "failed to disable link	" << endl;
+						cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed to disable link");
+					}
+					else
+					{
+						cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
 					}
 				}
-				cse4589_print_and_log("%s:SUCCESS",arg[0].c_str());
 			}
 			else if (arg[0].compare("crash") == 0)
 			{
-				cout << "update" << endl;
+				routing_table->is_crashed = true;
+				cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
 			}
 			else if (arg[0].compare("dump") == 0)
 			{
-				cout << "update" << endl;
+				if (-1 == updateForwardingTable(routing_table,rtable))
+				{
+					cse4589_print_and_log("%s:%s\n",arg[0].c_str(),"failed to display because failed to update forwarding table first");
+				}
+				struct header dgram;
+				char buf[128];
+				int numBytesInBuf = createDatagram(routing_table,&dgram,buf);
+				cse4589_dump_packet(buf,numBytesInBuf);
+				cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
 			}
 			else if (arg[0].compare("academic_integrity") == 0)
 			{
-				cout << "update" << endl;
-				cse4589_print_and_log("%s:SUCCESS",arg[0].c_str());
+				cse4589_print_and_log("I have read and understood the course academic integrity policy located "
+						"at http://www.cse.buffalo.edu/faculty/dimitrio/courses/cse4589_f14/index.html#integrity");
+				cse4589_print_and_log("%s:SUCCESS\n",arg[0].c_str());
 			}
 		}
 	}
@@ -395,13 +482,13 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 			if (lineNumber == 0)		//this line corresponds to the number of servers in the network
 			{
 				ftable->number_of_servers = atoi(buff);
-				cout << "number of servers is " << ftable->number_of_servers << endl;
+				//cout << "number of servers is " << ftable->number_of_servers << endl;
 				buffIndex = 0;
 			}
 			else if (lineNumber == 1)	//this line corresponds to the number of neighbors of this process
 			{
 				ftable->number_of_neighbors = atoi(buff);
-				cout << "number of neighbors is " << ftable->number_of_servers << endl;
+				//cout << "number of neighbors is " << ftable->number_of_servers << endl;
 			}
 			else if (lineNumber <= 1 + ftable->number_of_servers)	//populate forwarding table with values
 			{
@@ -416,15 +503,12 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 							{
 								cout << "failed to convert the buffer into an address structure" << endl;
 							}
-							/* REFERENCE THIS FOR PRINTING IP ADDRESS
-							ip = inet_ntoa(ftable->entries[entryIndex].sa.sin_addr);
-							cout << ip << endl;
-							*/
-
+							// REFERENCE THIS FOR PRINTING IP ADDRESS
+							//cout << inet_ntoa(ftable->entries[entryIndex].sa.sin_addr) << endl;
 							break;
 					case 2:
 							ftable->entries[entryIndex].server_port = atoi(buff);			//port in buffer
-							cout << ftable->entries[entryIndex].server_id << " " <<  ftable->entries[entryIndex].server_port << " " << endl;
+							//cout << ftable->entries[entryIndex].server_id << " " <<  ftable->entries[entryIndex].server_port << " " << endl;
 							entryIndex++;							//increment entryIndex because we populated each variable other than costs of this entry
 							break;
 				}
@@ -442,10 +526,10 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 							{
 								if (ftable->entries[i].server_id == currentNeighborId)
 								{
+									cout << "your neighbor is !" << ftable->entries[i].server_id << endl;
 									ftable->entries[i].cost = atoi(buff);
 									ftable->entries[i].is_neighbor = true;
 									ftable->entries[i].next_hop_id = ftable->server_id;
-									//cout << "server id " << currentNeighborId << "has cost " << 	ftable->entries[i].cost << endl;
 								}
 							}
 						break;
@@ -483,7 +567,7 @@ int readTopologyFile(char * filepath, struct forwarding_table *ftable)
 		ftable->entries[i].next_hop_id = ftable->server_id;
 	}
 
-	cout << "reading top file complete!" << endl;
+	//cout << "reading top file complete!" << endl;
 	return 0;
 }
 
@@ -711,19 +795,27 @@ int updateNeighbors(struct forwarding_table *ftable,struct forwarding_table **rt
 {
 	for (int i = 0; i < MAX_SERVERS; i++)
 	{
-		if (ftable->entries[i].cost != 0 && ftable->entries[i].cost != UINT16_MX && ftable->entries[i].is_neighbor && !ftable->entries[i].is_disabled)
+		time_t currentTime = time(NULL);
+		//cout << "checking stuff in updateNeighbors()" << endl;
+		if (ftable->entries[i].cost != 0
+				&& ftable->entries[i].cost != UINT16_MX
+				&& ftable->entries[i].is_neighbor
+				&& !ftable->entries[i].is_disabled)
 		{
 			if (-1 == updateForwardingTable(ftable,rtable))
 			{
-				cout << "failed to update forwarding table" << endl;
+				//cout << "failed to update forwarding table" << endl;
+				return -1;
 			}
+			//cout << "SENDING TABLE TO NEIGHBOR " << endl;
 			if (-1 == sendTable(ftable->entries[i].server_id, ftable))
 			{
-				cout << "failed to send forwarding table to id " << ftable->entries[i].server_id << endl;
+				//cout << "failed to send forwarding table to id " << ftable->entries[i].server_id << endl;
 				return -1;
 			}
 		}
 	}
+	//cout << "returned updateNeighbors()"<< endl;
 	return 0;
 }
 
@@ -747,11 +839,10 @@ int sendTable(int serverId, struct forwarding_table * ftable)
     		inet_ntop(AF_INET,&(ftable->entries[i].sa.sin_addr.s_addr),ip,INET_ADDRSTRLEN);
     	}
     }
-    //cout << "sending to ip: " << ip << endl;
+
 	/*
 		get the address info
 	*/
-
 	if (getaddrinfo(ip,portNumber,&hints,&response) != 0)
 	{
 		cout << "failed to get addr info: " << strerror(errno) << endl;
@@ -782,25 +873,33 @@ int sendTable(int serverId, struct forwarding_table * ftable)
 
 int insertIntoRouting(struct forwarding_table *ftable, struct forwarding_table **rtable)
 {
-	/* Check to see if the forwarding table being passed in is from a link that is disabled */
 	for (int i = 0; i < MAX_SERVERS; i ++)
 	{
 		if (rtable[0]->entries[i].server_id == ftable->server_id
-				&& rtable[0]->entries[i].is_disabled)
+				&& !rtable[0]->entries[i].is_neighbor)
 		{
-			cout << "Link has been disabled on this process to server id "
-					<< ftable->server_id << "will not insert the table" << endl;
-			return 0;
+			cout << "received datagram from non neighbor. returning now" << endl;
+			return -1;
 		}
 	}
-
 	int i = 0;
 	while (rtable[i] != NULL && i < MAX_SERVERS)
 	{
 		if (rtable[i]->server_id == ftable->server_id)
 		{
 			rtable[i] = ftable;			//replace the existing forwarding table with  the more up to date one
-			cout << "replacing existing ftable in rtable " << endl;
+			//cout << "replacing existing ftable in rtable " << endl;
+			return 0;
+		}
+		i++;
+	}
+
+	while (rtable[i] != NULL && i < MAX_SERVERS)
+	{
+		if (rtable[i]->server_id == ftable->server_id)
+		{
+			rtable[i] = ftable;			//replace the existing forwarding table with  the more up to date one
+			//cout << "replacing existing ftable in rtable " << endl;
 			return 0;
 		}
 		i++;
@@ -809,15 +908,17 @@ int insertIntoRouting(struct forwarding_table *ftable, struct forwarding_table *
 	if (i < MAX_SERVERS)		//rtable is not full. insert into table at the first null pointer
 	{
 		rtable[i] = ftable;
-		cout << "adding new entry to rtable " << endl;
+		return 0;
+		//cout << "adding new entry to rtable " << endl;
 	}
-	cout << "successfully updated routing table" << endl;
-	return 0;
+
+	cout << "could not insert table" << endl;
+	return -1;
 }
 int updateForwardingTable(struct forwarding_table * routing_table, struct forwarding_table **rtable)
 {
 	/*determining new costs of forwarding table*/
-	cout << "determining new costs of forwarding table " << endl;
+	//cout << "determining new costs of forwarding table " << endl;
 	time_t currentTime = time(NULL);
 
 	/* Before we proceed, we make each cost the maximum cost*/
@@ -842,21 +943,29 @@ int updateForwardingTable(struct forwarding_table * routing_table, struct forwar
 		}
 		else
 		{
-			cout << "setting cost of id to inf" << endl;
+			//cout << "setting cost of id to inf" << endl;
 			routing_table->entries[i].cost = UINT16_MX;
+			routing_table->entries[i].next_hop_id = -1;
+		}
+		if (rtable[0]->entries[i].cost == UINT16_MX)
+		{
+			routing_table->entries[i].next_hop_id = -1;
 		}
 	}
-
 	for (int i = 1; i < MAX_SERVERS; i ++)
 	{
 		time_t currentTime = time(NULL);
-		if (rtable[i]->last_packet_rcvd + 3 * TIMEOUT <= currentTime)
+		if (rtable[i] != NULL && rtable[i]->last_packet_rcvd + 3 * TIMEOUT <= currentTime)
 		{
+			//cout << "SERVER IS A GHOST!!!!!!" << endl;
 			for (int j = 0; j < MAX_SERVERS; j ++)
 			{
 				if (routing_table->entries[j].server_id == rtable[i]->server_id)
 				{
+					//cout << "setting cost to infinity and no longer a neighbor!" << endl;
 					routing_table->entries[j].cost = UINT16_MX;
+					routing_table->entries[j].next_hop_id = -1;
+					routing_table->entries[j].is_neighbor = false;
 				}
 			}
 			/* set link cost to infinity in routing table and disregard the routing table values */
@@ -868,9 +977,10 @@ int updateForwardingTable(struct forwarding_table * routing_table, struct forwar
 		/*
 		 * Determine shortest path to each node from this server node
 		 */
-		if (rtable[i] != NULL && !isDisabled(routing_table, rtable[i]->server_id) && rtable[i]->last_packet_rcvd + 3 * TIMEOUT <= currentTime)
+		if (rtable[i] != NULL && !isDisabled(routing_table, rtable[i]->server_id) && rtable[i]->last_packet_rcvd + 3 * TIMEOUT > currentTime)
 		{
-			if (-1 == updateTableEntry(routing_table,rtable[i],routing_table->entries[i].server_id))
+			//cout << "ATTEMPTING UPDATE!" << endl;
+			if (-1 == updateTableEntry(routing_table,rtable[0],rtable[i]))
 			{
 				cout << "failed to update Table Entry" << endl;
 				return -1;
@@ -880,7 +990,7 @@ int updateForwardingTable(struct forwarding_table * routing_table, struct forwar
 	return 0;
 }
 
-int updateTableEntry(struct forwarding_table *base,struct forwarding_table *comparee,int id)
+int updateTableEntry(struct forwarding_table *routing_table,struct forwarding_table *base,struct forwarding_table *comparee)
 {
 	/* DETERMINE COST TO COMPAREE */
 	int costToComparee = UINT16_MX;
@@ -891,19 +1001,17 @@ int updateTableEntry(struct forwarding_table *base,struct forwarding_table *comp
 			costToComparee = base->entries[i].cost;
 		}
 	}
-	cout << "cost to comparee is" << costToComparee << endl;
+
 	for (int i = 0; i < MAX_SERVERS; i++)
 	{
 		for (int j = 0; j < MAX_SERVERS; j++)
 		{
 			if (base->entries[i].server_id == comparee->entries[j].server_id)
 			{
-				//cout << "i is now " << i << endl;
-				if (comparee->entries[j].cost + costToComparee < base->entries[i].cost)
+				if (comparee->entries[j].cost + costToComparee < routing_table->entries[i].cost)
 				{
-					cout << "updated the cost of a link in a forwarding table for id " << comparee->server_id << endl;
-					base->entries[i].cost = comparee->entries[j].cost + costToComparee;
-					base->entries[i].next_hop_id = comparee->server_id;
+					routing_table->entries[i].cost = comparee->entries[j].cost + costToComparee;
+					routing_table->entries[i].next_hop_id = comparee->server_id;
 				}
 			}
 		}
@@ -958,4 +1066,86 @@ bool isDisabled(struct forwarding_table * routing_table, int serverId)
 		}
 	}
 	return false;
+}
+
+int display(struct forwarding_table *routing_table,int flag)
+{
+	/* <int server_id, int index> */
+	/* sort by server id */
+	int id[MAX_SERVERS];
+	int index[MAX_SERVERS];
+
+	for (int i = 0; i < MAX_SERVERS; i++)
+	{
+		id[i] = routing_table->entries[i].server_id;
+		index[i] = i;
+	}
+
+	/* RUN SELECTION SORT ON THE STRUCTURES */
+	/* sort the two arrays by ID */
+	for (int i = 0; i < MAX_SERVERS - 1; i++)
+	{
+		int min = i;
+		for (int j = i + 1; j < MAX_SERVERS; j ++)
+		{
+			if (id[j] < id[min])
+			{
+				min = j;
+			}
+		}
+		if (min != i)
+		{
+			/* SWAP */
+			int indexTemp = index[i];
+			int idTemp = id[i];
+
+			id[i] = id[min];
+			index[i] = index[min];
+
+			id[min] = idTemp;
+			index[min] = indexTemp;
+		}
+	}
+
+	for (int i = 0; i < MAX_SERVERS; i++)
+	{
+		for (int j = 0; j < MAX_SERVERS; j++)
+		{
+			if (id[i] == routing_table->entries[j].server_id)
+			{
+				if (flag == PACKET_FLAG)
+				{
+					cse4589_print_and_log("%-15d%-15d\n"
+						,routing_table->entries[j].server_id
+						,routing_table->entries[j].cost);
+				}
+				else if (flag == CMD_FLAG)
+				{
+					cse4589_print_and_log("%-15d%-15d%-15d\n"
+						,routing_table->entries[j].server_id
+						,routing_table->entries[j].next_hop_id
+						,routing_table->entries[j].cost);
+				}
+
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * WHEN UPDATING, ALWAYS PASS RTABLE[0] BECAUSE THIS HOLDS THE BASE INFO FOR THE SELF PROCESS TOPOLOGY FILE. NEED TO CHANGE THAT BASE INFO.
+ */
+int update(int serverId, int cost, struct forwarding_table *rtable)
+{
+	for (int i = 0; i < MAX_SERVERS; i ++)
+	{
+		if (serverId == rtable->entries[i].server_id)
+		{
+			rtable->entries[i].cost = cost;
+			return 0;
+		}
+	}
+
+	return -1;
 }
